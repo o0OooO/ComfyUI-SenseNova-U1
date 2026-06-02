@@ -825,6 +825,97 @@ class SenseNovaU1LocalInterleave(io.ComfyNode):
         return io.NodeOutput(*interleave_output_to_tuple(result))
 
 
+class SenseNovaU1LocalCompose(io.ComfyNode):
+    """多图参考融合(溶图):多张参考图 + prompt(用 <image> 占位符按序绑定每张图)
+    -> 一张融合图。比 ImageEdit 多了 image2..image6 可选输入,可同时喂角色/道具/场景。"""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="SenseNovaU1LocalCompose",
+            display_name="SenseNova U1 Local Compose (Multi-Ref)",
+            category=LOCAL_CATEGORY,
+            inputs=[
+                LocalModelIO.Input("u1_model"),
+                io.Image.Input("image"),
+                io.String.Input("prompt", multiline=True, default=""),
+                io.Boolean.Input("auto_size", default=True),
+                io.Int.Input("width", default=1024, min=32, max=8192, step=32),
+                io.Int.Input("height", default=1024, min=32, max=8192, step=32),
+                io.Float.Input("target_megapixels", default=1.048576, min=0.25, max=32.0, step=0.25),
+                io.Float.Input("input_megapixels", default=1.048576, min=0.0, max=32.0, step=0.25),
+                io.Float.Input("cfg_scale", default=4.0, min=0.0, max=20.0, step=0.1),
+                io.Float.Input("img_cfg_scale", default=1.0, min=0.0, max=20.0, step=0.1),
+                io.Combo.Input("cfg_norm", options=list(CFG_NORM_OPTIONS[:-1]), default="none"),
+                io.Float.Input("timestep_shift", default=3.0, min=0.0, max=20.0, step=0.1),
+                io.Float.Input("cfg_interval_start", default=0.0, min=0.0, max=1.0, step=0.05),
+                io.Float.Input("cfg_interval_end", default=1.0, min=0.0, max=1.0, step=0.05),
+                io.Int.Input("num_steps", default=50, min=1, max=200),
+                io.Int.Input("seed", default=DEFAULT_SEED, min=0, max=2**31 - 1),
+                io.Boolean.Input("think_mode", default=False, optional=True),
+                io.Image.Input("image2", optional=True),
+                io.Image.Input("image3", optional=True),
+                io.Image.Input("image4", optional=True),
+                io.Image.Input("image5", optional=True),
+                io.Image.Input("image6", optional=True),
+            ],
+            outputs=[
+                io.Image.Output(display_name="images"),
+                io.String.Output(display_name="text"),
+                io.String.Output(display_name="think_text"),
+                io.String.Output(display_name="metadata_json"),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        u1_model: SenseNovaU1LocalModel,
+        image,
+        prompt: str,
+        auto_size: bool,
+        width: int,
+        height: int,
+        target_megapixels: float,
+        input_megapixels: float,
+        cfg_scale: float,
+        img_cfg_scale: float,
+        cfg_norm: str,
+        timestep_shift: float,
+        cfg_interval_start: float,
+        cfg_interval_end: float,
+        num_steps: int,
+        seed: int,
+        think_mode: bool = False,
+        image2=None,
+        image3=None,
+        image4=None,
+        image5=None,
+        image6=None,
+    ) -> io.NodeOutput:
+        # 按顺序收集所有提供的参考图(image, image2..image6),与 prompt 里的 <image> 一一对应
+        input_images = [img for img in (image, image2, image3, image4, image5, image6) if img is not None]
+        input_max_pixels = int(target_pixels_from_megapixels(input_megapixels)) if input_megapixels > 0 else 0
+        result = u1_model.compose_images(
+            prompt=prompt,
+            input_images=input_images,
+            width=None if auto_size else width,
+            height=None if auto_size else height,
+            target_pixels=target_pixels_from_megapixels(target_megapixels),
+            input_max_pixels=input_max_pixels,
+            cfg_scale=cfg_scale,
+            img_cfg_scale=img_cfg_scale,
+            cfg_norm=cfg_norm,
+            timestep_shift=timestep_shift,
+            cfg_interval=(cfg_interval_start, cfg_interval_end),
+            num_steps=num_steps,
+            seed=seed,
+            think_mode=think_mode,
+        )
+        LOGGER.info("SenseNova U1 local compose generated: %s", comfy_image_info(result.images))
+        return io.NodeOutput(*output_to_tuple(result))
+
+
 class SenseNovaInterleavePreview(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -926,6 +1017,7 @@ class SenseNovaExtension(ComfyExtension):
             SenseNovaU1LocalLoader,
             SenseNovaU1LocalTextToImage,
             SenseNovaU1LocalImageEdit,
+            SenseNovaU1LocalCompose,
             SenseNovaU1LocalInterleave,
             SenseNovaInterleavePreview,
         ]

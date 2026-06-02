@@ -15,9 +15,9 @@ import numpy as np
 from PIL import Image
 
 try:
-    from .image_utils import comfy_image_to_pil, pil_to_comfy_image
+    from .image_utils import comfy_image_to_pil, comfy_batch_to_pil_images, pil_to_comfy_image
 except ImportError:  # pragma: no cover - supports direct imports during tests
-    from image_utils import comfy_image_to_pil, pil_to_comfy_image
+    from image_utils import comfy_image_to_pil, comfy_batch_to_pil_images, pil_to_comfy_image
 
 LOGGER = logging.getLogger(__name__)
 
@@ -453,6 +453,107 @@ class SenseNovaU1LocalModel:
                 "batch_size": batch_size,
                 "num_steps": num_steps,
                 "target_pixels": target_pixels,
+                "think_mode": think_mode,
+            },
+        )
+
+    def compose_images(
+        self,
+        *,
+        prompt: str,
+        input_images: list,
+        width: int | None,
+        height: int | None,
+        target_pixels: int,
+        input_max_pixels: int,
+        cfg_scale: float,
+        img_cfg_scale: float,
+        cfg_norm: str,
+        timestep_shift: float,
+        cfg_interval: tuple[float, float],
+        num_steps: int,
+        seed: int,
+        think_mode: bool,
+    ) -> LocalGenerationResult:
+        """多图参考融合(溶图):多张参考图 + prompt(用 <image> 占位符按序绑定每张图)
+        -> 一张融合图。底层 it2i_generate 原生支持多图(图数须 >= <image> 数,
+        多余的自动补在开头)。"""
+        if not prompt.strip():
+            raise RuntimeError("Compose prompt cannot be empty.")
+        if cfg_norm == "cfg_zero_star":
+            raise RuntimeError("cfg_zero_star is only supported for local text-to-image.")
+        if not input_images:
+            raise RuntimeError("compose_images requires at least one input image.")
+
+        # 每个 comfy IMAGE 可能是 batch;全部展开成 PIL 列表
+        pil_images: list = []
+        for img in input_images:
+            if img is None:
+                continue
+            pil_images.extend(comfy_batch_to_pil_images(img))
+        if not pil_images:
+            raise RuntimeError("No valid reference images provided.")
+
+        placeholders = prompt.count("<image>")
+        if placeholders > len(pil_images):
+            raise RuntimeError(
+                f"prompt has {placeholders} <image> placeholders but only "
+                f"{len(pil_images)} reference image(s) supplied (need images >= placeholders)."
+            )
+
+        # 每张参考图缩放到预算(防多图高分辨率 OOM)。0 = 按图数自动均分。
+        if input_max_pixels and input_max_pixels > 0:
+            per = input_max_pixels
+        else:
+            full = 2 * (2048 * 2048)
+            per = (2048 * 2048) if len(pil_images) <= 2 else max(512 * 512, full // len(pil_images))
+        pil_images = [_resize_input_to_budget(im, per) for im in pil_images]
+
+        out_width, out_height = _resolve_edit_size(
+            pil_images[0], width=width, height=height, target_pixels=target_pixels
+        )
+        _check_cfg_interval(cfg_interval)
+        torch = _import_torch()
+
+        with (
+            torch.inference_mode(),
+            self._offload_ctx() as offloaded,
+            _progress_hook(self.model, num_steps),
+        ):
+            out = offloaded.it2i_generate(
+                self.tokenizer,
+                prompt,
+                list(pil_images),
+                image_size=(out_width, out_height),
+                cfg_scale=cfg_scale,
+                img_cfg_scale=img_cfg_scale,
+                cfg_norm=cfg_norm,
+                timestep_shift=timestep_shift,
+                cfg_interval=cfg_interval,
+                num_steps=num_steps,
+                batch_size=1,
+                seed=seed,
+                think_mode=think_mode,
+            )
+        if think_mode:
+            tensor, think_text = out
+        else:
+            tensor, think_text = out, ""
+        return LocalGenerationResult(
+            images=_batch_tensor_to_comfy_image(tensor),
+            text="",
+            think_text=think_text,
+            metadata={
+                **self.info,
+                "task": "image-compose",
+                "num_references": len(pil_images),
+                "placeholders": placeholders,
+                "width": out_width,
+                "height": out_height,
+                "seed": seed,
+                "num_steps": num_steps,
+                "target_pixels": target_pixels,
+                "input_max_pixels": per,
                 "think_mode": think_mode,
             },
         )
